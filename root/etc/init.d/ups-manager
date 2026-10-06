@@ -96,8 +96,29 @@ HOSTSYNC 15
 DEADTIME 15
 POWERDOWNFLAG /etc/killpower
 EOF
-	chmod 640 /etc/nut/* 2>/dev/null || true
-	chown root:nut /etc/nut/* 2>/dev/null || true
+	mkdir -p /var/etc/nut
+	for f in ups.conf upsd.conf upsd.users upsmon.conf nut.conf; do
+		if [ -L "/etc/nut/$f" ] || [ ! -e "/etc/nut/$f" ]; then
+			ln -sfn "/var/etc/nut/$f" "/etc/nut/$f"
+		elif [ -f "/etc/nut/$f" ]; then
+			mv "/etc/nut/$f" "/var/etc/nut/$f"
+			ln -sfn "/var/etc/nut/$f" "/etc/nut/$f"
+		fi
+	done
+	if [ "$mode" = "netclient" ]; then
+		printf 'MODE=netclient\n' > /var/etc/nut/nut.conf
+	else
+		printf 'MODE=netserver\n' > /var/etc/nut/nut.conf
+	fi
+	chmod 755 /var/etc/nut
+	chmod 640 /var/etc/nut/ups.conf /var/etc/nut/upsd.conf /var/etc/nut/upsd.users /var/etc/nut/upsmon.conf 2>/dev/null || true
+	chmod 644 /var/etc/nut/nut.conf 2>/dev/null || true
+	if [ "$mode" != "netclient" ]; then
+		chgrp nut /var/etc/nut/ups.conf /var/etc/nut/upsd.conf /var/etc/nut/upsd.users 2>/dev/null || true
+	fi
+	chgrp nutmon /var/etc/nut/upsmon.conf 2>/dev/null || chgrp nut /var/etc/nut/upsmon.conf 2>/dev/null || true
+	chown root:nut /var/run/nut /var/state/ups 2>/dev/null || true
+	chmod 750 /var/run/nut /var/state/ups 2>/dev/null || true
 }
 
 start_service() {
@@ -111,27 +132,31 @@ start_service() {
 	# If upsd is not running and we are standalone/netserver, attempt to start driver and upsd
 	local mode=$(uci -q get ${CONF}.ups.mode || echo "standalone")
 	local driver=$(uci -q get ${CONF}.ups.driver || echo "usbhid-ups")
+	local ups_name=$(uci -q get ${CONF}.ups.name || echo "ups")
 	if [ "$mode" != "netclient" ]; then
-		# Clean dead socket or stale locks if driver is not actively serving upsd
-		if ! pgrep upsd >/dev/null 2>&1; then
-			killall -9 usbhid-ups blazer_usb blazer_ser 2>/dev/null || true
-			rm -f /var/run/nut/* /var/state/ups/* 2>/dev/null || true
+		local drv_bin="/lib/nut/$driver"
+		[ -x "$drv_bin" ] || drv_bin="/usr/lib/nut/$driver"
+		if [ -x "$drv_bin" ]; then
+			procd_open_instance "ups-driver"
+			procd_set_param command "$drv_bin" -D -a "$ups_name" -u nut
+			procd_set_param respawn 3600 5 0
+			procd_set_param stdout 1
+			procd_set_param stderr 1
+			procd_close_instance
+		else
+			logger -t ups-manager "NUT driver $driver is not installed"
 		fi
-
-		if ! pgrep -f "upsdrvctl" >/dev/null 2>&1 && ! pgrep -f "$driver" >/dev/null 2>&1; then
-			/usr/sbin/upsdrvctl start >/dev/null 2>&1 || true
-		fi
-		if ! pgrep upsd >/dev/null 2>&1; then
-			/usr/sbin/upsd >/dev/null 2>&1 || true
+		if [ -x /usr/sbin/upsd ]; then
+			procd_open_instance "upsd"
+			procd_set_param command /usr/sbin/upsd -D -u nut
+			procd_set_param respawn 3600 5 0
+			procd_set_param stdout 1
+			procd_set_param stderr 1
+			procd_close_instance
 		fi
 	fi
 
 	procd_open_instance "ups-manager-daemon"
-	procd_set_param command "$PROG"
-	procd_set_param respawn 3600 5 0
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
 
 	[ -x "/usr/bin/ups-manager-log-event" ] && /usr/bin/ups-manager-log-event ops "ops" "info" "UPS 配置与服务已加载" "驱动=$driver, 端口=$port, 模式=$mode, 监听=$listen_addr"
 }
